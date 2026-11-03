@@ -28,6 +28,7 @@
 
 #include <spawn.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/close_range.h>
@@ -114,6 +115,48 @@ struct __posix_spawnattr {
   } sigmask, sigdefault;
 };
 
+// Fallback for POSIX_SPAWN_CLOEXEC_DEFAULT on kernels without close_range(2)
+// (added in Linux 5.9): walk /proc/self/fd and set FD_CLOEXEC on every descriptor
+// above stderr. This runs in the child of vfork(), so it must stay
+// async-signal-safe: plain syscalls and stack storage only.
+static bool SetCloseOnExecForAllFds() {
+  int dir_fd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dir_fd == -1) return false;
+
+  alignas(8) char buffer[512];
+  bool ok = true;
+  while (ok) {
+    long bytes = syscall(__NR_getdents64, dir_fd, buffer, sizeof(buffer));
+    if (bytes == 0) break;
+    if (bytes < 0) {
+      ok = (errno == EINTR);
+      continue;
+    }
+
+    for (long pos = 0; pos < bytes;) {
+      dirent64* entry = reinterpret_cast<dirent64*>(buffer + pos);
+      pos += entry->d_reclen;
+
+      int fd = 0;
+      bool is_fd = true;
+      for (const char* p = entry->d_name; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') {
+          is_fd = false;
+          break;
+        }
+        fd = fd * 10 + (*p - '0');
+      }
+      if (!is_fd || fd <= STDERR_FILENO || fd == dir_fd) continue;
+
+      int fd_flags = fcntl(fd, F_GETFD);
+      if (fd_flags != -1) fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC);
+    }
+  }
+
+  close(dir_fd);
+  return ok;
+}
+
 static void ApplyAttrs(short flags, const posix_spawnattr_t* attr) {
   // POSIX: "If POSIX_SPAWN_SETSIGDEF is set ... signals in sigdefault ...
   // shall be set to their default actions in the child process."
@@ -154,7 +197,15 @@ static void ApplyAttrs(short flags, const posix_spawnattr_t* attr) {
 
   if ((flags & POSIX_SPAWN_CLOEXEC_DEFAULT) != 0) {
     // mark all open fds except stdin/out/err as close-on-exec
-    if (close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)) _exit(127);
+    if (close_range(3, ~0U, CLOSE_RANGE_CLOEXEC) != 0) {
+      // close_range(2) was added in Linux 5.9. Kernels older than that return ENOSYS
+      // here, and failing the spawn would surface to the caller as a successful
+      // posix_spawn() followed by a silent exit(127) in the child (this is how
+      // dnsmasq and clatd ended up never starting on the 4.19 kernel). Keep the
+      // documented CLOEXEC_DEFAULT semantics by walking /proc/self/fd instead.
+      if (errno != ENOSYS) _exit(127);
+      if (!SetCloseOnExecForAllFds()) _exit(127);
+    }
   }
 }
 
